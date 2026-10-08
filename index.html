@@ -66,6 +66,11 @@
         .guest-layout.tally-prev .big-tally-text { display: block; background: #22c55e; color: black; }
         .error-msg { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(239,68,68,0.9); color: white; padding: 20px; border-radius: 12px; font-weight: bold; text-align: center; z-index: 200; max-width: 80%; }
 
+        /* --- ESTADO DE ENLACE (guest) --- */
+        .link-status { position: absolute; top: 14px; right: 14px; z-index: 120; display: flex; gap: 8px; }
+        .link-dot { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 900; text-transform: uppercase; padding: 5px 10px; border-radius: 20px; background: rgba(0,0,0,0.7); border: 1px solid #334155; color: #64748b; }
+        .link-dot.on { border-color: #22c55e; color: #22c55e; }
+
         @keyframes pulseRed { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
     </style>
 </head>
@@ -80,6 +85,12 @@
             } 
         };
         const MQTT_BROKER = 'wss://broker.emqx.io:8084/mqtt';
+
+        // Extrae el ID del peer desde el mensaje de PeerJS ("Could not connect to peer sc_dir_XXXX")
+        const extractPeerId = (msg) => {
+            const m = /([A-Za-z0-9_\-]+)\s*$/.exec((msg || '').trim());
+            return m ? m[1] : null;
+        };
 
         // --- DIRECTOR / OBS ---
         const ReceiverView = ({ roomName, isObsMode }) => {
@@ -96,8 +107,11 @@
             const remoteVideoRef = useRef(null);
             const mqttClient = useRef(null);
             const returnStreamRef = useRef(null);
+            const currentCallRef = useRef(null);
 
             useEffect(() => {
+                let destroyed = false;
+
                 try {
                     mqttClient.current = mqtt.connect(MQTT_BROKER);
                     if (!isObsMode) {
@@ -112,30 +126,78 @@
                     const myId = isObsMode ? `sc_obs_${baseId}` : `sc_dir_${baseId}`;
                     peer.current = new Peer(myId, PEER_CONFIG);
 
+                    peer.current.on('open', () => {
+                        setStatus('ESPERANDO INVITADO...');
+                    });
+
                     peer.current.on('call', (call) => {
-                        call.answer(); 
+                        // Cerramos cualquier llamada anterior del mismo invitado (reconexión)
+                        try { currentCallRef.current?.close(); } catch (e) {}
+                        currentCallRef.current = call;
+
+                        call.answer();
+
                         call.on('stream', (stream) => {
+                            if (destroyed) return;
                             if (remoteVideoRef.current) {
                                 remoteVideoRef.current.srcObject = stream;
-                                setGuestConnected(true);
-                                setStatus('ONLINE');
                             }
+                            setGuestConnected(true);
+                            setStatus('ONLINE');
                         });
+
                         call.on('close', () => {
+                            if (destroyed) return;
+                            setGuestConnected(false);
+                            setStatus('INVITADO DESCONECTADO');
+                        });
+
+                        call.on('error', () => {
+                            if (destroyed) return;
                             setGuestConnected(false);
                             setStatus('INVITADO DESCONECTADO');
                         });
                     });
+
                     peer.current.on('error', (err) => {
-                        setStatus(`ESPERANDO INVITADO...`);
+                        if (destroyed) return;
+
+                        // El invitado aún no está: es normal, no lo tratamos como error
+                        if (err.type === 'peer-unavailable') {
+                            setStatus('ESPERANDO INVITADO...');
+                            return;
+                        }
+
+                        // La sala ya está abierta en otra pestaña con el mismo ID
+                        if (err.type === 'unavailable-id') {
+                            setStatus('ID EN USO');
+                            setErrorMsg('Esta sala ya está abierta en otra pestaña. Ciérrala o usa otro nombre de sala.');
+                            return;
+                        }
+
+                        if (err.type === 'network' || err.type === 'server-error') {
+                            setStatus('RECONECTANDO...');
+                            return;
+                        }
+
+                        console.warn('Peer error:', err.type, err.message);
                     });
+
+                    peer.current.on('disconnected', () => {
+                        if (destroyed) return;
+                        setStatus('RECONECTANDO...');
+                        try { peer.current.reconnect(); } catch (e) {}
+                    });
+
                 } catch (e) {
                     console.error('Error Director:', e);
                     setErrorMsg(`Error: ${e.message}`);
                 }
                 
                 return () => { 
-                    peer.current?.destroy(); 
+                    destroyed = true;
+                    try { currentCallRef.current?.close(); } catch (e) {}
+                    try { peer.current?.destroy(); } catch (e) {}
                     if (mqttClient.current) mqttClient.current.end(); 
                 };
             }, [roomName, isObsMode]);
@@ -155,7 +217,10 @@
                         returnStreamRef.current = s;
                         peer.current.call(`sc_guest_${roomName.toUpperCase()}`, s);
                         setTalkbackActive(true);
-                    } catch (e) { console.error('Error retorno:', e); }
+                    } catch (e) { 
+                        console.error('Error retorno:', e);
+                        setErrorMsg(`Retorno: ${e.message}`);
+                    }
                 }
             };
 
@@ -217,104 +282,255 @@
             const [facingMode, setFacingMode] = useState('user');
             const [errorMsg, setErrorMsg] = useState('');
             const [loading, setLoading] = useState(false);
-            
+            const [links, setLinks] = useState({ dir: false, obs: false });
+
             const localVideoRef = useRef(null);
             const returnMediaRef = useRef(null);
             const peer = useRef(null);
             const mqttClient = useRef(null);
             const localStream = useRef(null);
 
+            const facingModeRef = useRef('user');
+            const callState = useRef({});      // targetId -> { status, call, timeout }
+            const retryTimer = useRef(null);
+
             const switchCamera = async () => {
-                const nextMode = facingMode === 'user' ? 'environment' : 'user';
+                if (!localStream.current) return;
+                const nextMode = facingModeRef.current === 'user' ? 'environment' : 'user';
+                facingModeRef.current = nextMode;
                 setFacingMode(nextMode);
-                if (localStream.current) {
-                    const videoTrack = localStream.current.getVideoTracks()[0];
-                    if (videoTrack) videoTrack.stop();
-                    const res = { '360': [640,360], '720': [1280,720], '1080': [1920,1080] };
-                    try {
-                        const newVideoState = await navigator.mediaDevices.getUserMedia({ 
-                            video: { width: res[quality][0], height: res[quality][1], facingMode: nextMode }
+
+                const res = { '360': [640,360], '720': [1280,720], '1080': [1920,1080] };
+                try {
+                    const newVideoState = await navigator.mediaDevices.getUserMedia({ 
+                        video: { width: res[quality][0], height: res[quality][1], facingMode: nextMode }
+                    });
+                    const newVideoTrack = newVideoState.getVideoTracks()[0];
+                    const oldVideoTrack = localStream.current.getVideoTracks()[0];
+
+                    // Reemplazamos la pista en todas las conexiones activas
+                    const conns = peer.current?.connections || {};
+                    Object.keys(conns).forEach(peerId => {
+                        (conns[peerId] || []).forEach(connection => {
+                            try {
+                                const pc = connection.peerConnection || connection._pc || connection._negotiator?._pc;
+                                if (!pc || !pc.getSenders) return;
+                                const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                                if (sender) sender.replaceTrack(newVideoTrack);
+                            } catch (e) { console.warn('replaceTrack:', e); }
                         });
-                        const newVideoTrack = newVideoState.getVideoTracks()[0];
-                        if (peer.current) {
-                            Object.values(peer.current.connections).forEach(connArray => {
-                                connArray.forEach(connection => {
-                                    if (connection.peerConnection) {
-                                        const videoSender = connection.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
-                                        if (videoSender) videoSender.replaceTrack(newVideoTrack);
-                                    }
-                                });
-                            });
-                        }
-                        if (localStream.current) {
-                            const oldVideoTrack = localStream.current.getVideoTracks()[0];
-                            localStream.current.removeTrack(oldVideoTrack);
-                            localStream.current.addTrack(newVideoTrack);
-                            if (localVideoRef.current) localVideoRef.current.srcObject = localStream.current;
-                            if (oldVideoTrack) oldVideoTrack.stop();
-                        }
-                    } catch (e) { console.error('Error switchCamera:', e); }
-                }
+                    });
+
+                    localStream.current.removeTrack(oldVideoTrack);
+                    localStream.current.addTrack(newVideoTrack);
+                    if (oldVideoTrack) oldVideoTrack.stop();
+                    if (localVideoRef.current) localVideoRef.current.srcObject = localStream.current;
+                } catch (e) { console.error('Error switchCamera:', e); }
             };
 
             useEffect(() => {
                 if (!joined) return;
+
+                let destroyed = false;
+                let mq = null;
+
                 setLoading(true);
                 setErrorMsg('');
-                
-                let mq;
+
+                const baseId = roomName.toUpperCase();
+                const targets = [`sc_dir_${baseId}`, `sc_obs_${baseId}`];
+
+                targets.forEach(t => { callState.current[t] = { status: 'idle', call: null, timeout: null }; });
+
+                // ---- MQTT: TALLY ----
                 try {
                     mq = mqtt.connect(MQTT_BROKER);
                     mqttClient.current = mq;
-                    mq.on('connect', () => { mq.subscribe(`sc_tally/${roomName.toUpperCase()}`); });
+                    mq.on('connect', () => mq.subscribe(`sc_tally/${baseId}`));
                     mq.on('message', (t, msg) => {
                         try {
                             const data = JSON.parse(msg.toString());
-                            if (t.includes('tally')) setTally(data.state);
-                        } catch(e) {}
+                            if (t.includes('tally')) setTally(data.state || 'idle');
+                        } catch (e) {}
                     });
-                } catch (e) { console.error('MQTT Error:', e); }
-                
+                    mq.on('error', (e) => console.warn('MQTT error:', e.message));
+                } catch (e) { console.warn('MQTT Error:', e); }
+
+                // ---- LLAMADAS CON REINTENTO ----
+                const resetState = (targetId) => {
+                    const st = callState.current[targetId];
+                    if (!st) return;
+                    if (st.timeout) clearTimeout(st.timeout);
+                    st.timeout = null;
+                    try { st.call?.close(); } catch (e) {}
+                    st.call = null;
+                    st.status = 'idle';
+                };
+
+                const attemptCall = (targetId) => {
+                    if (destroyed) return;
+                    const st = callState.current[targetId];
+                    if (!st || st.status !== 'idle') return;
+                    if (!peer.current || peer.current.destroyed || !localStream.current) return;
+
+                    st.status = 'trying';
+
+                    let call = null;
+                    try {
+                        call = peer.current.call(targetId, localStream.current);
+                    } catch (e) {
+                        st.status = 'idle';
+                        return;
+                    }
+                    if (!call) { st.status = 'idle'; return; }
+                    st.call = call;
+
+                    call.on('stream', (rem) => {
+                        if (destroyed) return;
+                        st.status = 'live';
+                        if (st.timeout) { clearTimeout(st.timeout); st.timeout = null; }
+                        setLinks(prev => ({ ...prev, [targetId.startsWith('sc_dir') ? 'dir' : 'obs']: true }));
+
+                        // Retorno del director (PIP)
+                        if (targetId.startsWith('sc_dir') && rem.getVideoTracks().length > 0) {
+                            if (returnMediaRef.current) returnMediaRef.current.srcObject = rem;
+                            setReceivingVideo(true);
+                        }
+                    });
+
+                    call.on('close', () => {
+                        if (destroyed) return;
+                        setLinks(prev => ({ ...prev, [targetId.startsWith('sc_dir') ? 'dir' : 'obs']: false }));
+                        resetState(targetId);
+                    });
+
+                    call.on('error', () => {
+                        if (destroyed) return;
+                        setLinks(prev => ({ ...prev, [targetId.startsWith('sc_dir') ? 'dir' : 'obs']: false }));
+                        resetState(targetId);
+                    });
+
+                    // Red de seguridad: si en 6 s no hubo error, damos la conexión por buena
+                    st.timeout = setTimeout(() => {
+                        if (st.status === 'trying') {
+                            st.status = 'live';
+                            st.timeout = null;
+                        }
+                    }, 6000);
+                };
+
+                const attemptAll = () => targets.forEach(attemptCall);
+
+                // ---- INIT ----
                 const init = async () => {
                     try {
                         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                            throw new Error('getUserMedia no disponible. ¿HTTPS?');
+                            throw new Error('getUserMedia no disponible. Se requiere HTTPS.');
                         }
+
                         const res = { '360': [640,360], '720': [1280,720], '1080': [1920,1080] };
                         const s = await navigator.mediaDevices.getUserMedia({ 
-                            video: { width: { ideal: res[quality][0] }, height: { ideal: res[quality][1] }, facingMode: facingMode }, 
+                            video: { width: { ideal: res[quality][0] }, height: { ideal: res[quality][1] }, facingMode: facingModeRef.current }, 
                             audio: { echoCancellation: true, noiseSuppression: true } 
                         });
+
+                        if (destroyed) { s.getTracks().forEach(t => t.stop()); return; }
+
                         localStream.current = s;
                         if (localVideoRef.current) localVideoRef.current.srcObject = s;
-                        
-                        const baseId = roomName.toUpperCase();
+
                         peer.current = new Peer(`sc_guest_${baseId}`, PEER_CONFIG);
+
                         peer.current.on('open', () => {
-                            peer.current.call(`sc_dir_${baseId}`, localStream.current);
-                            peer.current.call(`sc_obs_${baseId}`, localStream.current);
+                            if (destroyed) return;
+                            setLoading(false);
+                            attemptAll();
+                            // Reintento periódico (solo actúa sobre los targets en estado "idle")
+                            retryTimer.current = setInterval(attemptAll, 4000);
                         });
+
                         peer.current.on('error', (err) => {
-                            setErrorMsg(`Peer: ${err.type}`);
+                            if (destroyed) return;
+
+                            // *** AQUÍ SE CORRIGE EL ERROR 'peer-unavailable' ***
+                            // Es totalmente normal: el director u OBS todavía no tiene la página abierta.
+                            if (err.type === 'peer-unavailable') {
+                                const id = extractPeerId(err.message);
+                                if (id && callState.current[id]) {
+                                    resetState(id);
+                                    setLinks(prev => ({ ...prev, [id.startsWith('sc_dir') ? 'dir' : 'obs']: false }));
+                                } else {
+                                    // No pudimos identificar el destino: reintentamos los que estén intentando
+                                    Object.keys(callState.current).forEach(k => {
+                                        if (callState.current[k].status === 'trying') resetState(k);
+                                    });
+                                }
+                                return; // NO se muestra al usuario
+                            }
+
+                            if (err.type === 'unavailable-id') {
+                                setErrorMsg('Esta sala ya está abierta en otra pestaña. Ciérrala y recarga.');
+                                setLoading(false);
+                                return;
+                            }
+
+                            if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+                                // PeerJS intenta reconectar solo; solo avisamos en consola
+                                console.warn('Peer error:', err.type, err.message);
+                                return;
+                            }
+
+                            console.warn('Peer error:', err.type, err.message);
                         });
+
+                        peer.current.on('disconnected', () => {
+                            if (destroyed) return;
+                            try { peer.current.reconnect(); } catch (e) {}
+                        });
+
+                        // Llamadas ENTRANTES = retorno del director (talkback)
                         peer.current.on('call', (c) => {
-                            c.answer(localStream.current);
-                            c.on('stream', (rem) => { 
-                                if (returnMediaRef.current) returnMediaRef.current.srcObject = rem; 
-                                setReceivingVideo(rem.getVideoTracks().length > 0); 
+                            c.answer(); // no devolvemos nada en esta llamada
+                            c.on('stream', (rem) => {
+                                if (destroyed) return;
+                                if (rem.getVideoTracks().length > 0) {
+                                    if (returnMediaRef.current) returnMediaRef.current.srcObject = rem;
+                                    setReceivingVideo(true);
+                                }
                             });
+                            c.on('close', () => { if (!destroyed) setReceivingVideo(false); });
                         });
+
                         setLoading(false);
+
                     } catch (e) {
                         console.error('Error init:', e);
-                        setErrorMsg(`Error: ${e.message}`);
-                        setLoading(false);
+                        if (!destroyed) {
+                            setErrorMsg(`Error: ${e.message}`);
+                            setLoading(false);
+                        }
                     }
                 };
+
                 init();
-                
-                return () => { peer.current?.destroy(); if (mq) mq.end(); };
-            }, [joined, roomName, quality, facingMode]);
+
+                return () => {
+                    destroyed = true;
+                    if (retryTimer.current) { clearInterval(retryTimer.current); retryTimer.current = null; }
+                    Object.keys(callState.current).forEach(k => {
+                        if (callState.current[k]?.timeout) clearTimeout(callState.current[k].timeout);
+                        try { callState.current[k]?.call?.close(); } catch (e) {}
+                    });
+                    callState.current = {};
+                    try { peer.current?.destroy(); } catch (e) {}
+                    peer.current = null;
+                    if (mq) mq.end();
+                    localStream.current?.getTracks().forEach(t => t.stop());
+                    localStream.current = null;
+                };
+                // Solo dependemos de joined/roomName: quality y facingMode se gestionan por pistas
+                // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, [joined, roomName]);
 
             const toggleMic = () => { 
                 if (localStream.current) { 
@@ -347,6 +563,12 @@
                 <div className={`guest-layout tally-${tally}`}>
                     <div className="guest-tally-border"></div>
                     <div className="big-tally-text">{tally === 'live' ? 'AL AIRE' : tally === 'prev' ? 'PREVENIDO' : ''}</div>
+
+                    <div className="link-status">
+                        <div className={`link-dot ${links.dir ? 'on' : ''}`}>DIR {links.dir ? '✓' : '…'}</div>
+                        <div className={`link-dot ${links.obs ? 'on' : ''}`}>OBS {links.obs ? '✓' : '…'}</div>
+                    </div>
+
                     <div className={`return-pip ${receivingVideo ? 'active' : ''}`}>
                         <video ref={returnMediaRef} autoPlay playsInline muted={false}></video>
                         <div className="pip-label">RETORNO</div>
@@ -374,7 +596,7 @@
                 let m = params.get('mode'); 
                 let r = params.get('room');
                 if (m && r) { 
-                    setRoomName(r); 
+                    setRoomName(r.toUpperCase()); 
                     setMode(m); 
                     if (m === 'obs') document.body.classList.add('obs-mode'); 
                 } else {
